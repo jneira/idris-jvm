@@ -12,7 +12,7 @@ import Data.List
 getLocTy : Map Int InferredType -> Int -> IO InferredType
 getLocTy typesByIndex varIndex = do
     optTy <- Map.get typesByIndex varIndex
-    pure $ fromMaybe IUnknown optTy
+    pure $ fromMaybe IUnknown $ nullableToMaybe optTy
 
 getVarIndex : Map Int InferredType -> Int -> IO Int
 getVarIndex types index = go 0 0 where
@@ -125,9 +125,9 @@ checkcast cname              = Checkcast cname
 export
 asmCast : (sourceType: InferredType) -> (targetType: InferredType) -> Asm ()
 
-asmCast ty1@(IRef class1) ty2@(IRef class2) = when (class1 /= class2) (checkcast class2)
+asmCast ty1@(IRef class1 _ _) ty2@(IRef class2 _ _) = when (class1 /= class2) (checkcast class2)
 
-asmCast IUnknown ty@(IRef clazz) = checkcast clazz
+asmCast IUnknown ty@(IRef clazz _ _) = checkcast clazz
 
 asmCast IBool IBool     = Pure ()
 asmCast IByte IByte     = Pure ()
@@ -138,6 +138,7 @@ asmCast IInt IInt       = Pure ()
 asmCast ILong ILong     = Pure ()
 asmCast IFloat IFloat   = Pure ()
 asmCast IDouble IDouble = Pure ()
+asmCast (IArray _) (IArray _) = Pure ()
 
 asmCast IBool IInt = boolToInt
 asmCast IInt IChar = I2c
@@ -182,10 +183,12 @@ asmCast IFloat ty = boxFloat
 
 asmCast IDouble ty = boxDouble
 
-asmCast (IRef _) arr@(IArray _) = Checkcast $ getJvmTypeDescriptor arr
+asmCast (IRef _ _ _) arr@(IArray _) = Checkcast $ getJvmTypeDescriptor arr
+asmCast (IArray _) (IRef clazz _ _) = Checkcast clazz
 
+asmCast _ IVoid = Pure ()
 asmCast IVoid IVoid = Pure ()
-asmCast IVoid (IRef _) = Aconstnull
+asmCast IVoid (IRef _ _ _) = Aconstnull
 asmCast IVoid IUnknown = Aconstnull
 asmCast ty IUnknown = Pure ()
 
@@ -267,7 +270,8 @@ loadVar sourceLocTys ILong ILong  var = opWithWordSize sourceLocTys Lload var
 loadVar sourceLocTys IFloat IFloat var = opWithWordSize sourceLocTys Fload var
 loadVar sourceLocTys IFloat IDouble var = opWithWordSize sourceLocTys (\var => do Fload var; F2d) var
 loadVar sourceLocTys IDouble IDouble var = opWithWordSize sourceLocTys Dload var
-loadVar sourceLocTys IDouble IFloat var = opWithWordSize sourceLocTys (\var => do Dload var; D2f)  var
+loadVar sourceLocTys IDouble IFloat var = opWithWordSize sourceLocTys (\var => do Dload var; D2f) var
+loadVar sourceLocTys ty1@(IArray _) ty2@(IArray _) var = opWithWordSize sourceLocTys Aload var
 
 loadVar sourceLocTys IBool ty var = loadAndBoxBool ty sourceLocTys var
 loadVar sourceLocTys IByte ty var = loadAndBoxByte ty sourceLocTys var
@@ -295,24 +299,33 @@ loadVar sourceLocTys ty ILong var =
     let loadInstr = \index => do Aload index; objToLong
     in opWithWordSize sourceLocTys loadInstr var
 
+loadVar sourceLocTys _ (IRef "java/math/BigInteger" _ _) var =
+    let loadInstr = \index => do
+      Aload index
+      InvokeMethod InvokeStatic conversionClass "toInteger" "(Ljava/lang/Object;)Ljava/math/BigInteger;" False
+    in opWithWordSize sourceLocTys loadInstr var
+
 loadVar sourceLocTys ty IFloat var =
     let loadInstr = \index => do Aload index; objToFloat
     in opWithWordSize sourceLocTys loadInstr var
 
 loadVar sourceLocTys ty IDouble var = loadAndUnboxDouble ty sourceLocTys var
 
-loadVar sourceLocTys IUnknown arr@(IArray _) var =
+loadVar sourceLocTys _ arr@(IArray _) var =
     let loadInstr = \index => do Aload index; checkcast $ getJvmTypeDescriptor arr
     in opWithWordSize sourceLocTys loadInstr var
 
-loadVar sourceLocTys IUnknown ty2@(IRef _) var =
+loadVar sourceLocTys IUnknown ty2@(IRef _ _ _) var =
     let loadInstr = \index => do Aload index; asmCast IUnknown ty2
     in opWithWordSize sourceLocTys loadInstr var
 
-loadVar sourceLocTys (IRef _) IUnknown var = opWithWordSize sourceLocTys Aload var
+loadVar sourceLocTys (IArray _) (IRef _ _ _) var = opWithWordSize sourceLocTys Aload var
+loadVar sourceLocTys (IArray _) IUnknown var = opWithWordSize sourceLocTys Aload var
+
+loadVar sourceLocTys (IRef _ _ _) IUnknown var = opWithWordSize sourceLocTys Aload var
 loadVar sourceLocTys IUnknown IUnknown var = opWithWordSize sourceLocTys Aload var
 
-loadVar sourceLocTys ty1@(IRef _) ty2@(IRef _) var =
+loadVar sourceLocTys ty1@(IRef _ _ _) ty2@(IRef _ _ _) var =
     let loadInstr = \index => do Aload index; asmCast ty1 ty2
     in opWithWordSize sourceLocTys loadInstr var
 
@@ -335,6 +348,7 @@ storeVar IInt IInt       var = do types <- getVariableTypes; opWithWordSize type
 storeVar ILong ILong     var = do types <- getVariableTypes; opWithWordSize types Lstore var
 storeVar IFloat IFloat   var = do types <- getVariableTypes; opWithWordSize types Fstore var
 storeVar IDouble IDouble var = do types <- getVariableTypes; opWithWordSize types Dstore var
+storeVar (IArray _) (IArray _) var = do types <- getVariableTypes; opWithWordSize types Astore var
 
 storeVar IBool ty var = boxStore boxBool var
 storeVar IByte ty var = boxStore boxByte var
@@ -364,7 +378,7 @@ storeVar ty IDouble var = storeVarWithWordSize (\index => do asmCast ty IDouble;
 storeVar ty arr@(IArray elemTy) var =
     storeVarWithWordSize (\index => do checkcast $ getJvmTypeDescriptor arr; Astore index) var
 
-storeVar ty targetTy@(IRef _) var = do
+storeVar ty targetTy@(IRef _ _ _) var = do
     types <- getVariableTypes
     asmCast ty targetTy
     opWithWordSize types Astore var

@@ -3,40 +3,42 @@ module Compiler.Jvm.Codegen
 import Compiler.Common
 import Compiler.CompileExpr
 import Compiler.Inline
+import Compiler.NoMangle
 
 import Core.Context
 import Core.Directory
 import Core.Name
+import Core.Options
 import Core.TT
 
 import Data.List
+import Data.List1
 import Data.Maybe
-import Libraries.Data.SortedMap
 import Data.String
 import Data.Vect
 
-import Core.Directory
-import Core.Options
-import Libraries.Utils.Path
+import Debug.Trace
 
 import Libraries.Data.NameMap
+import Libraries.Data.SortedMap
+import Libraries.Utils.Path
 
 import System.File
 import System.FFI
 import System.Info
 
 import Compiler.Jvm.Asm
-import Compiler.Jvm.Math
-import Compiler.Jvm.MockAsm
-import Compiler.Jvm.Optimizer
+import Compiler.Jvm.Export
+import Compiler.Jvm.ExtPrim
+import Compiler.Jvm.FunctionTree
 import Compiler.Jvm.InferredType
 import Compiler.Jvm.Jname
-import Compiler.Jvm.Variable
-import Compiler.Jvm.Tree
-import Compiler.Jvm.FunctionTree
-import Compiler.Jvm.ExtPrim
+import Compiler.Jvm.Math
+import Compiler.Jvm.Optimizer
 import Compiler.Jvm.ShowUtil
+import Compiler.Jvm.Tree
 import Compiler.Jvm.Tuples
+import Compiler.Jvm.Variable
 
 import Idris.Syntax
 
@@ -82,14 +84,6 @@ withScope op = do
     op
     exitScope scopeIndex
 
-%inline
-methodStartLabel : String
-methodStartLabel = "methodStartLabel"
-
-%inline
-methodEndLabel : String
-methodEndLabel = "methodEndLabel"
-
 defaultValue : InferredType -> Asm ()
 defaultValue IBool = Iconst 0
 defaultValue IByte = Iconst 0
@@ -100,6 +94,42 @@ defaultValue ILong = Ldc $ Int64Const 0
 defaultValue IFloat = Fconst 0
 defaultValue IDouble = Dconst 0
 defaultValue _ = Aconstnull
+
+assembleArray : (elemTy: InferredType) -> Asm ()
+assembleArray IBool = Anewbooleanarray
+assembleArray IByte = Anewbytearray
+assembleArray IChar = Anewchararray
+assembleArray IShort = Anewshortarray
+assembleArray IInt = Anewintarray
+assembleArray ILong = Anewlongarray
+assembleArray IFloat = Anewfloatarray
+assembleArray IDouble = Anewdoublearray
+assembleArray (IRef ty _ _) = Anewarray ty
+assembleArray (IArray ty) = Anewarray (getJvmTypeDescriptor ty)
+assembleArray (IFunction (MkJavaLambdaType (IRef ty _ _) _ _ _)) = Anewarray ty
+assembleArray _ = Anewarray "java/lang/Object"
+
+storeArray : (elemTy: InferredType) -> Asm ()
+storeArray IBool = Bastore
+storeArray IByte = Bastore
+storeArray IChar = Castore
+storeArray IShort = Sastore
+storeArray IInt = Iastore
+storeArray ILong = Lastore
+storeArray IFloat = Fastore
+storeArray IDouble = Dastore
+storeArray _ = Aastore
+
+loadArray : (elemTy: InferredType) -> Asm ()
+loadArray IBool = Baload
+loadArray IByte = Baload
+loadArray IChar = Caload
+loadArray IShort = Saload
+loadArray IInt = Iaload
+loadArray ILong = Laload
+loadArray IFloat = Faload
+loadArray IDouble = Daload
+loadArray _ = Aaload
 
 jIntKind : PrimType -> IntKind
 jIntKind ty = fromMaybe (Signed (P 32)) (intKind ty)
@@ -135,8 +165,8 @@ hashCode (Str value) = Just $ Object.hashCode value
 hashCode x = Nothing
 
 getHashCodeSwitchClass : FC -> InferredType -> Asm String
-getHashCodeSwitchClass fc (IRef "java/lang/String") = Pure stringClass
-getHashCodeSwitchClass fc (IRef "java/math/BigInteger") = Pure bigIntegerClass
+getHashCodeSwitchClass fc (IRef "java/lang/String" _ _) = Pure stringClass
+getHashCodeSwitchClass fc (IRef "java/math/BigInteger" _ _) = Pure bigIntegerClass
 getHashCodeSwitchClass fc ILong = Pure "java/lang/Long"
 getHashCodeSwitchClass fc constantType = asmCrash ("Constant type " ++ show constantType ++ " cannot be compiled to 'Switch'.")
 
@@ -208,11 +238,8 @@ assembleBits64 isTailCall returnType value = do
     when isTailCall $ asmReturn returnType
 
 isInterfaceInvocation : InferredType -> Bool
-isInterfaceInvocation (IRef className) = "i:" `isPrefixOf` className
+isInterfaceInvocation (IRef _ Interface _) = True
 isInterfaceInvocation _ = False
-
-%foreign "jvm:.startsWith(java/lang/String java/lang/String boolean),java/lang/String"
-startsWith : String -> String -> Bool
 
 assembleNil : (isTailCall: Bool) -> InferredType -> Asm ()
 assembleNil isTailCall returnType = do
@@ -263,6 +290,18 @@ getLambdaTypeByArity 3 = Function3Lambda
 getLambdaTypeByArity 4 = Function4Lambda
 getLambdaTypeByArity 5 = Function5Lambda
 getLambdaTypeByArity _ = FunctionLambda
+
+assembleClassLiteral : InferredType -> Asm ()
+assembleClassLiteral IByte   = Field GetStatic "java/lang/Byte" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral IChar   = Field GetStatic "java/lang/Character" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral IShort  = Field GetStatic "java/lang/Short" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral IBool   = Field GetStatic "java/lang/Boolean" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral IDouble = Field GetStatic "java/lang/Double" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral IFloat  = Field GetStatic "java/lang/Float" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral IInt    = Field GetStatic "java/lang/Integer" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral ILong   = Field GetStatic "java/lang/Long" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral IVoid   = Field GetStatic "java/lang/Void" "TYPE"  "Ljava/lang/Class;"
+assembleClassLiteral type    = Ldc $ TypeConst $ getJvmTypeDescriptor type
 
 intToBigInteger : Asm ()
 intToBigInteger = do
@@ -338,7 +377,9 @@ mutual
 
     assembleExpr isTailCall returnType (NmApp _ (NmRef _ idrisName) []) =
         assembleNmAppNilArity isTailCall returnType idrisName
-    assembleExpr isTailCall returnType (NmApp _ (NmRef _ idrisName) args) = do
+    assembleExpr isTailCall returnType (NmApp _ (NmRef _ idrisName) args) =
+      if isSuperCall idrisName args then do Aconstnull; when isTailCall $ asmReturn returnType
+      else do
         let jname = jvmName idrisName
         functionType <- case !(findFunctionType jname) of
             Just ty => Pure ty
@@ -561,7 +602,7 @@ mutual
     assembleExprComparableBinaryBoolOp : InferredType -> String -> (String -> Asm ()) ->
         NamedCExp -> NamedCExp -> Asm ()
     assembleExprComparableBinaryBoolOp returnType className operator expr1 expr2 = do
-        let exprType = IRef className
+        let exprType = IRef className Class []
         assembleExpr False exprType expr1
         assembleExpr False exprType expr2
         ifLabel <- newLabel
@@ -1209,7 +1250,7 @@ mutual
             when (lambdaType == DelayedLambda) $ do
                 New "io/github/mmhelloworld/idrisjvm/runtime/MemoizedDelayed"
                 Dup
-            let lambdaInterfaceType = getLambdaInterfaceType lambdaType lambdaBodyReturnType
+            let lambdaInterfaceType = getLambdaInterfaceType lambdaType
             parameterType <- the (Asm (Maybe InferredType)) $ traverse getVariableType (jvmSimpleName <$> parameterName)
             variableTypes <- LiftIo $ Map.values {key=Int} !(loadClosures declaringScope scope)
             maybe (Pure ()) id parameterValueExpr
@@ -1241,7 +1282,6 @@ mutual
             let oldLineNumberLabels = lineNumberLabels !GetState
             newLineNumberLabels <- LiftIo $ Map.newTreeMap {key=Int} {value=String}
             updateState $ { lineNumberLabels := newLineNumberLabels }
-            className <- getClassName
             let accessModifiers = if isExtracted then [Public, Static] else [Public, Static, Synthetic]
             CreateMethod accessModifiers "" lambdaClassName lambdaMethodName implementationMethodDescriptor
                 Nothing Nothing [] []
@@ -1284,7 +1324,7 @@ mutual
             loadVariables _ _ [] = Pure ()
             loadVariables declaringScopeVariableTypes types (var :: vars) = do
                 sourceTargetTypeEntry <- LiftIo $ Map.get types var
-                (sourceType, targetType) <- LiftIo $ readSourceTargetType sourceTargetTypeEntry
+                (sourceType, targetType) <- LiftIo $ readSourceTargetType $ nullableToMaybe sourceTargetTypeEntry
                 loadVar declaringScopeVariableTypes sourceType targetType var
                 loadVariables declaringScopeVariableTypes types vars
 
@@ -1471,7 +1511,7 @@ mutual
         let constructorType = if hasTypeCase then "Ljava/lang/String;" else "I"
         variableTypes <- getVariableTypes
         optTy <- LiftIo $ Map.get variableTypes idrisObjectVariableIndex
-        let idrisObjectVariableType = fromMaybe IUnknown optTy
+        let idrisObjectVariableType = fromMaybe IUnknown $ nullableToMaybe optTy
         loadVar variableTypes idrisObjectVariableType idrisObjectType idrisObjectVariableIndex
         when (idrisObjectVariableType /= idrisObjectType) $ do
             storeVar idrisObjectType idrisObjectType idrisObjectVariableIndex
@@ -1486,7 +1526,7 @@ mutual
     assembleConCaseExpr returnType idrisObjectVariableIndex args expr = do
             variableTypes <- getVariableTypes
             optTy <- LiftIo $ Map.get variableTypes idrisObjectVariableIndex
-            let idrisObjectVariableType = fromMaybe IUnknown optTy
+            let idrisObjectVariableType = fromMaybe IUnknown $ nullableToMaybe optTy
             bindArg idrisObjectVariableType variableTypes 0 args
             assembleExpr True returnType expr
         where
@@ -1584,7 +1624,7 @@ mutual
         assembleExpr False IInt (NmLocal fc $ UN $ Basic hashCodePositionVariableName)
         assembleConstructorSwitch returnType fc idrisObjectVariableIndex
             (hashPositionSwitchAlts hashPositionAndAlts) def
-    where
+      where
         conAltHashCodeExpr : FC -> (Int, NamedConAlt) -> Asm (Int, Int, NamedConAlt)
         conAltHashCodeExpr fc positionAndAlt@(position, MkNConAlt name _ _ _ _) =
             case hashCode (Str $ getIdrisConstructorClassName (jvmSimpleName name)) of
@@ -1626,6 +1666,79 @@ mutual
                     switchBody label nextLabel position alt
                     go nextLabel positionAndAlts
 
+    asmJavaLambda : FC -> InferredType -> NamedCExp -> NamedCExp -> NamedCExp -> Asm ()
+    asmJavaLambda fc returnType functionType javaInterfaceType lambda = do
+        assembleExpr False inferredLambdaType lambda
+        lambdaType <- getJavaLambdaType fc [functionType, javaInterfaceType, lambda]
+        let samType =
+          if isIoAction then {parameterTypes $= dropWorldType} lambdaType.methodType else lambdaType.methodType
+        let lambdaImplementationType = lambdaType.implementationType
+        let lambdaImplementationType = updateImplementationType samType.returnType lambdaImplementationType
+        let invokeDynamicType = MkInferredFunctionType lambdaType.javaInterface [inferredLambdaType]
+        let invokeDynamicDescriptor = getMethodDescriptor invokeDynamicType
+        let implementationParameterTypes = lambdaImplementationType.parameterTypes
+        let implementationMethodType = MkInferredFunctionType lambdaImplementationType.returnType
+              (inferredLambdaType :: implementationParameterTypes)
+        let implementationMethodDescriptor = getMethodDescriptor implementationMethodType
+        let instantiatedMethodDescriptor = getMethodDescriptor lambdaImplementationType
+        lambdaClassMethodName <- getLambdaImplementationMethodName "lambda"
+        let lambdaMethodName = methodName lambdaClassMethodName
+        let lambdaClassName = className lambdaClassMethodName
+        invokeDynamic lambdaClassName lambdaMethodName lambdaType.methodName invokeDynamicDescriptor
+            (getMethodDescriptor samType) implementationMethodDescriptor instantiatedMethodDescriptor
+        asmCast lambdaType.javaInterface returnType
+        let accessModifiers = [Public, Static, Synthetic]
+        CreateMethod accessModifiers "" lambdaClassName lambdaMethodName implementationMethodDescriptor
+          Nothing Nothing [] []
+        MethodCodeStart
+        Aload 0
+        let arity = (cast {to=Int} $ length implementationParameterTypes) + 1
+        typesByIndex <- LiftIo $ Map.fromList $ zip [0 .. arity - 1]
+          (inferredLambdaType :: implementationParameterTypes)
+        applyParameters typesByIndex 1 lambdaImplementationType.returnType implementationParameterTypes
+        MaxStackAndLocal (-1) (-1)
+        MethodCodeEnd
+      where
+        isIoAction : Bool
+        isIoAction = Optimizer.isIoAction functionType
+
+        dropWorldType : List InferredType -> List InferredType
+        dropWorldType [] = []
+        dropWorldType parameterTypes@(_ :: _) = init parameterTypes
+
+        updateImplementationType : InferredType -> InferredFunctionType -> InferredFunctionType
+        updateImplementationType IVoid functionType =
+          if isIoAction
+            then {returnType := IVoid, parameterTypes $= dropWorldType} functionType
+            else {returnType := IVoid} functionType
+        updateImplementationType _ functionType =
+          if isIoAction then {parameterTypes $= dropWorldType} functionType else functionType
+
+        applyParameter : Map Int InferredType -> (isIoApplication: Bool) -> Int -> InferredType -> Asm ()
+        applyParameter typesByIndex isIoApplication index parameterType = do
+          loadArgument
+          InvokeMethod InvokeInterface "java/util/function/Function" "apply" "(Ljava/lang/Object;)Ljava/lang/Object;" True
+          InvokeMethod InvokeStatic runtimeClass "unwrap" "(Ljava/lang/Object;)Ljava/lang/Object;" False
+         where
+          loadArgument : Asm ()
+          loadArgument =
+            if isIoApplication
+              then do
+                Iconst 0
+                InvokeMethod InvokeStatic "java/lang/Integer" "valueOf" "(I)Ljava/lang/Integer;" False
+              else loadVar typesByIndex parameterType inferredObjectType index
+
+        applyParameters : Map Int InferredType -> Int -> InferredType -> List InferredType -> Asm ()
+        applyParameters typesByIndex index returnType [] = do
+          when isIoAction $ applyParameter typesByIndex True index inferredObjectType
+          asmCast inferredObjectType returnType
+          when (returnType == IVoid) Pop
+          asmReturn returnType
+        applyParameters typesByIndex index returnType (ty :: rest) = do
+          applyParameter typesByIndex False index ty
+          when (rest /= [] || isIoAction) $ asmCast inferredObjectType inferredLambdaType
+          applyParameters typesByIndex (index + 1) returnType rest
+
     jvmExtPrim : FC -> InferredType -> ExtPrim -> List NamedCExp -> Asm ()
     jvmExtPrim fc returnType JvmInstanceMethodCall [ret, NmApp _ _ [functionNamePrimVal], fargs, world] =
       jvmExtPrim fc returnType JvmInstanceMethodCall [ret, functionNamePrimVal, fargs, world]
@@ -1635,32 +1748,81 @@ mutual
         argTypes <- traverse tySpec (map fst instanceMethodArgs)
         methodReturnType <- tySpec ret
         let (cname, mnameWithDot) = break (== '.') fn
-        traverse_ assembleParameter $ zip (snd obj :: map snd instanceMethodArgs) (IRef cname :: argTypes)
-        let methodDescriptor = getMethodDescriptor $ MkInferredFunctionType methodReturnType argTypes
+        traverse_ assembleParameter $ zip (snd obj :: map snd instanceMethodArgs) (iref cname [] :: argTypes)
         let (_, mname) = break (/= '.') mnameWithDot
         instanceType <- tySpec $ fst obj
         let isInterfaceInvocation = isInterfaceInvocation instanceType
         let invocationType = if isInterfaceInvocation then InvokeInterface else InvokeVirtual
+        let methodDescriptor = getMethodDescriptor $ MkInferredFunctionType methodReturnType argTypes
         InvokeMethod invocationType cname mname methodDescriptor isInterfaceInvocation
         asmCast methodReturnType returnType
+    jvmExtPrim fc returnType JvmSuper [clazz, fargs, world] = do
+      rootMethodName <- getRootMethodName
+      if endsWith (methodName rootMethodName) "$ltinit$gt"
+        then
+          do
+            IRef typeName _ _ <- tySpec clazz
+              | _ => asmCrash ("super constructor should be called with a reference type but got " ++ show clazz)
+            let functionNamePrimVal = NmPrimVal fc (Str (typeName ++ "." ++ "<super>"))
+            jvmExtPrim fc returnType JvmStaticMethodCall [NmErased fc, functionNamePrimVal, fargs, world]
+        else Aconstnull
     jvmExtPrim fc returnType JvmStaticMethodCall [ret, NmApp _ _ [functionNamePrimVal], fargs, world] =
       jvmExtPrim fc returnType JvmStaticMethodCall [ret, functionNamePrimVal, fargs, world]
     jvmExtPrim _ returnType JvmStaticMethodCall [ret, NmPrimVal fc (Str fn), fargs, world] = do
         args <- getFArgs fargs
         argTypes <- traverse tySpec (map fst args)
-        methodReturnType <- tySpec ret
         let (cname, mnameWithDot) = break (== '.') fn
         let (_, mname) = break (/= '.') mnameWithDot
         let isConstructor = mname == "<init>"
         when isConstructor $ do
             New cname
             Dup
+        let isSuper = mname == "<super>"
+        when isSuper $ Aload 0
         traverse_ assembleParameter $ zip (map snd args) argTypes
+        methodReturnType <- if isSuper then Pure IVoid else tySpec ret
         let descriptorReturnType = if isConstructor then IVoid else methodReturnType
         let methodDescriptor = getMethodDescriptor $ MkInferredFunctionType descriptorReturnType argTypes
-        let invocationType = if isConstructor then InvokeSpecial else InvokeStatic
+        let invocationType = if isConstructor || isSuper then InvokeSpecial else InvokeStatic
+        let mname = if isSuper then "<init>" else mname
         InvokeMethod invocationType cname mname methodDescriptor False
         asmCast methodReturnType returnType
+    jvmExtPrim _ returnType SetInstanceField [ret, NmPrimVal fc (Str fn), fargs, world] = do
+        (obj :: value :: []) <- getFArgs fargs
+            | _ => asmCrash ("Setting an instance field should have two arguments for " ++ fn)
+        fieldType <- tySpec (fst value)
+        let (cname, fnameWithDot) = break (== '.') fn
+        assembleExpr False (iref cname []) (snd obj)
+        assembleExpr False fieldType (snd value)
+        let (_, fieldName) = break (\c => c /= '.' && c /= '#' && c /= '=') fnameWithDot
+        Field PutField cname fieldName (getJvmTypeDescriptor fieldType)
+        Aconstnull
+        asmCast inferredObjectType returnType
+    jvmExtPrim _ returnType SetStaticField [ret, NmPrimVal fc (Str fn), fargs, world] = do
+        (value :: []) <- getFArgs fargs
+            | _ => asmCrash ("Setting a static field should have one argument for " ++ fn)
+        fieldType <- tySpec (fst value)
+        let (cname, fnameWithDot) = break (== '.') fn
+        assembleExpr False fieldType (snd value)
+        let (_, fieldName) = break (\c => c /= '.' && c /= '#' && c /= '=') fnameWithDot
+        Field PutStatic cname fieldName (getJvmTypeDescriptor fieldType)
+        Aconstnull
+        asmCast inferredObjectType returnType
+    jvmExtPrim _ returnType GetInstanceField [ret, NmPrimVal fc (Str fn), fargs, world] = do
+        (obj :: []) <- getFArgs fargs
+            | _ => asmCrash ("Getting an instance field should have one argument for " ++ fn)
+        fieldType <- tySpec ret
+        let (cname, fnameWithDot) = break (== '.') fn
+        assembleExpr False (iref cname []) (snd obj)
+        let (_, fieldName) = break (\c => c /= '.' && c /= '#') fnameWithDot
+        Field GetField cname fieldName (getJvmTypeDescriptor fieldType)
+        asmCast fieldType returnType
+    jvmExtPrim _ returnType GetStaticField [ret, NmPrimVal fc (Str fn), fargs, world] = do
+        fieldType <- tySpec ret
+        let (cname, fnameWithDot) = break (== '.') fn
+        let (_, fieldName) = break (\c => c /= '.' && c /= '#') fnameWithDot
+        Field GetStatic cname fieldName (getJvmTypeDescriptor fieldType)
+        asmCast fieldType returnType
     jvmExtPrim _ returnType NewArray [_, size, val, world] = do
         assembleExpr False IInt size
         assembleExpr False IUnknown val
@@ -1677,6 +1839,30 @@ mutual
         assembleExpr False IUnknown val
         InvokeMethod InvokeVirtual arrayListClass "set" "(ILjava/lang/Object;)Ljava/lang/Object;" False
         asmCast inferredObjectType returnType
+    jvmExtPrim _ returnType JvmNewArray [tyExpr, size, world] = do
+        assembleExpr False IInt size
+        elemTy <- tySpec tyExpr
+        assembleArray elemTy
+        asmCast (IArray elemTy) returnType
+    jvmExtPrim _ returnType JvmSetArray [tyExpr, index, val, arr, world] = do
+        elemTy <- tySpec tyExpr
+        assembleExpr False (IArray elemTy) arr
+        assembleExpr False IInt index
+        assembleExpr False elemTy val
+        storeArray elemTy
+        Aconstnull
+        asmCast inferredObjectType returnType
+    jvmExtPrim _ returnType JvmGetArray [tyExpr, index, arr, world] = do
+        elemTy <- tySpec tyExpr
+        assembleExpr False (IArray elemTy) arr
+        assembleExpr False IInt index
+        loadArray elemTy
+        asmCast elemTy returnType
+    jvmExtPrim _ returnType JvmArrayLength [tyExpr, arr] = do
+        elemTy <- tySpec tyExpr
+        assembleExpr False (IArray elemTy) arr
+        Arraylength
+        asmCast IInt returnType
     jvmExtPrim _ returnType NewIORef [_, val, world] = do
         New refClass
         Dup
@@ -1703,6 +1889,18 @@ mutual
         Ldc $ StringConst "Error: Executed 'void'"
         InvokeMethod InvokeStatic runtimeClass "crash" "(Ljava/lang/String;)Ljava/lang/Object;" False
         asmCast inferredObjectType returnType
+    jvmExtPrim _ returnType JvmClassLiteral [ty] = do
+        assembleClassLiteral !(tySpec ty)
+        asmCast (IRef "java/lang/Class" Class []) returnType
+    jvmExtPrim _ returnType JvmInstanceOf [_, obj, ty] = do
+        assembleExpr False IUnknown obj
+        typeName <- getJvmReferenceTypeName !(tySpec ty)
+        InstanceOf typeName
+        asmCast IBool returnType
+    jvmExtPrim _ returnType JvmRefEq [_, _, firstObj, secondObj] =
+      assembleExprBinaryBoolOp returnType IUnknown Ifacmpne firstObj secondObj
+    jvmExtPrim fc returnType JavaLambda [functionType, javaInterfaceType, lambda] =
+      asmJavaLambda fc returnType functionType javaInterfaceType lambda
     jvmExtPrim _ returnType MakeFuture [_, action] = do
         assembleExpr False delayedType action
         InvokeMethod InvokeStatic runtimeClass "fork" "(Lio/github/mmhelloworld/idrisjvm/runtime/Delayed;)Ljava/util/concurrent/ForkJoinTask;" False
@@ -1710,6 +1908,17 @@ mutual
     jvmExtPrim _ returnType (Unknown name) _ = asmCrash $ "Can't compile unknown external directive " ++ show name
     jvmExtPrim fc _ prim args = Throw fc $ "Unsupported external function " ++ show prim ++ "(" ++
         (show $ showNamedCExp 0 <$> args) ++ ")"
+
+initializeFunctionState : Asm ()
+initializeFunctionState = do
+  lineNumberLabels <- LiftIo $ Map.newTreeMap {key=Int} {value=String}
+  updateState $ {
+      scopeCounter := 0,
+      currentScopeIndex := 0,
+      lambdaCounter := 0,
+      labelCounter := 1,
+      lineNumberLabels := lineNumberLabels }
+  updateCurrentFunction $ { dynamicVariableCounter := 0 }
 
 assembleDefinition : Name -> FC -> Asm ()
 assembleDefinition idrisName fc = do
@@ -1723,14 +1932,7 @@ assembleDefinition idrisName fc = do
     let declaringClassName = className jvmClassAndMethodName
     let methodName = methodName jvmClassAndMethodName
     let methodReturnType = returnType functionType
-    lineNumberLabels <- LiftIo $ Map.newTreeMap {key=Int} {value=String}
-    updateState $ {
-        scopeCounter := 0,
-        currentScopeIndex := 0,
-        lambdaCounter := 0,
-        labelCounter := 1,
-        lineNumberLabels := lineNumberLabels }
-    updateCurrentFunction $ { dynamicVariableCounter := 0 }
+    initializeFunctionState
     let optimizedExpr = optimizedBody function
     when (shouldDebugFunction jname) $ logAsm $ "Assembling " ++ declaringClassName ++ "." ++ methodName ++ "\n" ++
       showNamedCExp 0 optimizedExpr
@@ -1741,7 +1943,7 @@ assembleDefinition idrisName fc = do
     let classInitOrMethodName = if isField then "<clinit>" else methodName
     when isField $ do
         CreateField [Public, Static, Final] fileName declaringClassName methodName
-            "Lio/github/mmhelloworld/idrisjvm/runtime/MemoizedDelayed;" Nothing Nothing
+            "Lio/github/mmhelloworld/idrisjvm/runtime/MemoizedDelayed;" Nothing Nothing []
         FieldEnd
     CreateMethod [Public, Static] fileName declaringClassName classInitOrMethodName descriptor Nothing Nothing [] []
     if (not isField)
@@ -1771,8 +1973,7 @@ createMainMethod programName mainFunctionName = do
     function <- getFunction mainFunctionName
     let idrisMainClassMethodName = jvmClassMethodName function
     let mainClassName = className idrisMainClassMethodName
-    CreateMethod [Public, Static] "Main.idr" mainClassName "main" "([Ljava/lang/String;)V"
-        Nothing Nothing [] []
+    CreateMethod [Public, Static] "Main.idr" mainClassName "main" "([Ljava/lang/String;)V" Nothing Nothing [] []
     MethodCodeStart
     Ldc $ StringConst programName
     Aload 0
@@ -1783,20 +1984,6 @@ createMainMethod programName mainFunctionName = do
     Return
     MaxStackAndLocal (-1) (-1)
     MethodCodeEnd
-
-asm : AsmState -> Asm a -> IO (a, AsmState)
-asm = if shouldDebugAsm then mockRunAsm else runAsm
-
-getJvmClassMethodName : String -> Name -> Jname
-getJvmClassMethodName programName name =
-    let jname = jvmName name
-    in getIdrisFunctionName programName (className jname) (methodName jname)
-
-%foreign jvm' "io/github/mmhelloworld/idrisjvm/runtime/Runtime" "waitForFuturesToComplete" "java/util/List" "void"
-prim_waitForFuturesToComplete : List ThreadID -> PrimIO ()
-
-waitForFuturesToComplete : List ThreadID -> IO ()
-waitForFuturesToComplete futures = primIO $ prim_waitForFuturesToComplete futures
 
 groupByClassName : String -> List Name -> List (List Name)
 groupByClassName programName names = unsafePerformIO $ do
@@ -1811,29 +1998,22 @@ groupByClassName programName names = unsafePerformIO $ do
         go2 (name :: names) = do
             let jvmClassName = className $ getJvmClassMethodName programName name
             existingNamesOpt <- Map.get namesByClassName jvmClassName
-            let newNames = maybe [name] ((::) name) existingNamesOpt
+            let newNames = maybe [name] ((::) name) $ nullableToMaybe existingNamesOpt
             _ <- Map.put {key=String} {value=List Name} namesByClassName jvmClassName newNames
             go2 names
-
-createAsmState : AsmGlobalState -> Name -> IO AsmState
-createAsmState globalState name = do
-    programName <- AsmGlobalState.getProgramName globalState
-    let jvmClassMethodName = getJvmClassMethodName programName name
-    assembler <- getAssembler globalState (className jvmClassMethodName)
-    newAsmState globalState assembler
 
 assemble : AsmGlobalState -> Map String (FC, NamedDef) -> Name -> IO ()
 assemble globalState fcAndDefinitionsByName name = do
     fcDef <- Map.get {value=(FC, NamedDef)} fcAndDefinitionsByName (jvmSimpleName name)
-    case fcDef of
+    case nullableToMaybe fcDef of
         Just (fc, def) => do
             programName <- AsmGlobalState.getProgramName globalState
             asmState <- createAsmState globalState name
             ignore $ asm asmState $ do
                 inferDef programName name fc def
                 assembleDefinition name fc
-                scopes <- LiftIo $ JList.new {a=Scope}
-                updateCurrentFunction $ { scopes := scopes, optimizedBody := emptyFunction }
+                scopes <- LiftIo $ ArrayList.new {elemTy=Scope}
+                updateCurrentFunction $ { scopes := (subtyping scopes), optimizedBody := emptyFunction }
         Nothing => pure ()
 
 assembleAsync : AsmGlobalState -> Map String (FC, NamedDef) -> List (List Name) -> IO ()
@@ -1856,10 +2036,445 @@ isForeignDef : (Name, FC, NamedDef) -> Bool
 isForeignDef (_, _, MkNmForeign _ _ _) = True
 isForeignDef _ = False
 
+exportConstructor : Map Int InferredType -> InferredType -> Int -> Jname -> Name -> InferredFunctionType -> Asm ()
+exportConstructor jvmArgumentTypesByIndex jvmReturnType arity jvmIdrisName idrisName idrisFunctionType = do
+  function <- getCurrentFunction
+  initializeFunctionState
+  let optimizedExpr = optimizedBody function
+  let internalJname = function.idrisName
+  when (shouldDebugFunction internalJname) $ logAsm $ "Assembling " ++ (className internalJname) ++ "." ++
+    (methodName internalJname) ++ "\n" ++ showNamedCExp 0 optimizedExpr
+  CreateLabel methodStartLabel
+  CreateLabel methodEndLabel
+  LabelStart methodStartLabel
+  withScope $ do
+    scopeIndex <- getCurrentScopeIndex
+    scope <- getScope scopeIndex
+    let (lineNumberStart, lineNumberEnd) = lineNumbers scope
+    addLineNumber lineNumberStart methodStartLabel
+    updateScopeStartLabel scopeIndex methodStartLabel
+    updateScopeEndLabel scopeIndex methodEndLabel
+    assembleExpr False IVoid (optimizedBody function)
+    loadArguments jvmArgumentTypesByIndex idrisName arity (parameterTypes idrisFunctionType)
+    let idrisMethodDescriptor = getMethodDescriptor idrisFunctionType
+    programName <- getProgramName
+    let qualifiedJvmIdrisName = getIdrisFunctionName programName (className jvmIdrisName) (methodName jvmIdrisName)
+    InvokeMethod InvokeStatic
+      (className qualifiedJvmIdrisName) (methodName qualifiedJvmIdrisName) idrisMethodDescriptor False
+    InvokeMethod InvokeStatic (programName ++ "/PrimIO") "unsafePerformIO" "(Ljava/lang/Object;)Ljava/lang/Object;" False
+    asmCast (returnType idrisFunctionType) jvmReturnType
+    asmReturn jvmReturnType
+    LabelStart methodEndLabel
+  MaxStackAndLocal (-1) (-1)
+  MethodCodeEnd
+
+exportFunction : MethodExport -> Asm ()
+exportFunction (MkMethodExport jvmFunctionName idrisName type shouldPerformIO encloser modifiers annotations parameterAnnotations) = do
+    let jvmClassName = encloser.name
+    let fileName = fst $ getSourceLocationFromFc emptyFC
+    let MkInferredFunctionType jvmReturnType jvmArgumentTypes = type
+    let arity = length jvmArgumentTypes
+    let arityInt = the Int $ cast $ length jvmArgumentTypes
+    jvmArgumentTypesByIndex <- LiftIo $ Map.fromList $ zip [0 .. (arityInt - 1)] jvmArgumentTypes
+    let isInstance = not $ elem Static modifiers
+    jvmArgumentTypesForSignature <- adjustArgumentsForInstanceMember idrisName isInstance jvmArgumentTypes
+    let functionType = MkInferredFunctionType jvmReturnType jvmArgumentTypesForSignature
+    let exportedFieldName = jvmFunctionName
+    let simpleIdrisName = dropAllNS idrisName
+    let asmAnnotations = asmAnnotation <$> annotations
+    let asmParameterAnnotations = (\annotations => asmAnnotation <$> annotations) <$> parameterAnnotations
+    let descriptor = getMethodDescriptor functionType
+    let signature = Just $ getMethodSignature functionType
+    CreateMethod modifiers fileName jvmClassName jvmFunctionName descriptor signature Nothing asmAnnotations
+      asmParameterAnnotations
+    MethodCodeStart
+    (_, MkNmFun idrisFunctionArgs idrisFunctionBody) <- getFcAndDefinition (jvmSimpleName idrisName)
+      | _ => asmCrash ("Unknown idris function " ++ show idrisName)
+    let idrisFunctionArity = length idrisFunctionArgs
+    let idrisArgumentTypes = replicate idrisFunctionArity inferredObjectType
+    let idrisFunctionType = MkInferredFunctionType inferredObjectType idrisArgumentTypes
+    let jvmIdrisName = jvmName idrisName
+    let isField = idrisFunctionArity == 0
+    let isConstructor = jvmFunctionName == "<init>"
+    if isConstructor
+      then exportConstructor jvmArgumentTypesByIndex jvmReturnType arityInt jvmIdrisName idrisName idrisFunctionType
+      else if not isField then do
+        loadArguments jvmArgumentTypesByIndex idrisName arityInt (parameterTypes idrisFunctionType)
+        let idrisMethodDescriptor = getMethodDescriptor idrisFunctionType
+        programName <- getProgramName
+        let qualifiedJvmIdrisName = getIdrisFunctionName programName (className jvmIdrisName)
+                                      (methodName jvmIdrisName)
+        InvokeMethod InvokeStatic
+          (className qualifiedJvmIdrisName) (methodName qualifiedJvmIdrisName) idrisMethodDescriptor False
+        when shouldPerformIO $
+          InvokeMethod InvokeStatic (programName ++ "/PrimIO") "unsafePerformIO"
+            "(Ljava/lang/Object;)Ljava/lang/Object;" False
+        asmCast (returnType idrisFunctionType) jvmReturnType
+        asmReturn jvmReturnType
+        MaxStackAndLocal (-1) (-1)
+        MethodCodeEnd
+      else do
+        programName <- getProgramName
+        let qualifiedJvmIdrisName = getIdrisFunctionName programName (className jvmIdrisName)
+                                      (methodName jvmIdrisName)
+        Field GetStatic (className qualifiedJvmIdrisName) (methodName qualifiedJvmIdrisName)
+            "Lio/github/mmhelloworld/idrisjvm/runtime/MemoizedDelayed;"
+        InvokeMethod InvokeVirtual "io/github/mmhelloworld/idrisjvm/runtime/MemoizedDelayed" "evaluate"
+            "()Ljava/lang/Object;" False
+        asmCast inferredObjectType jvmReturnType
+        asmReturn jvmReturnType
+        MaxStackAndLocal (-1) (-1)
+        MethodCodeEnd
+
+exportField : FieldExport -> Asm ()
+exportField (MkFieldExport fieldName type encloser modifiers annotations) = do
+  let jvmClassName = encloser.name
+  let asmAnnotations = asmAnnotation <$> annotations
+  CreateField modifiers "Unknown.idr" jvmClassName fieldName (getJvmTypeDescriptor type) Nothing Nothing asmAnnotations
+  FieldEnd
+
+exportClass : ClassExport -> Asm ()
+exportClass (MkClassExport name idrisName extends implements modifiers annotations) = do
+  CreateClass [ComputeMaxs, ComputeFrames]
+  let annotations = filter (not . isIdrisJvmAnnotation) annotations
+  let signature = getSignature extends ++ concat (getSignature <$> implements)
+  extendsTypeName <- getJvmReferenceTypeName extends
+  implementsTypeNames <- traverse getJvmReferenceTypeName implements
+  let asmAnnotations = asmAnnotation <$> annotations
+  ClassCodeStart 52 modifiers name (Just signature) extendsTypeName implementsTypeNames asmAnnotations
+
+generateAccessors : SortedMap ClassExport (List ExportDescriptor) -> ClassExport ->
+                      (accessorCreator: FieldExport -> Asm ()) -> Asm ()
+generateAccessors descriptorsByEncloser classExport accessorCreator = do
+  let className = classExport.name
+  let fields = getFields $ fromMaybe [] $ SortedMap.lookup classExport descriptorsByEncloser
+  traverse_ accessorCreator fields
+
+generateGetters : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateGetters descriptorsByEncloser classExport =
+  generateAccessors descriptorsByEncloser classExport (createGetter classExport)
+
+generateSetters : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateSetters descriptorsByEncloser classExport =
+  generateAccessors descriptorsByEncloser classExport (createSetter classExport)
+
+generateConstructor : SortedMap ClassExport (List ExportDescriptor) -> ClassExport ->
+                        List FieldExport -> Asm ()
+generateConstructor descriptorsByEncloser classExport fields = do
+  let fieldTypes = FieldExport.type <$> fields
+  let descriptor = getMethodDescriptor $ MkInferredFunctionType IVoid fieldTypes
+  let signature = Just $ getMethodSignature $ MkInferredFunctionType IVoid fieldTypes
+  let classType = iref classExport.name []
+  extendsTypeName <- getJvmReferenceTypeName classExport.extends
+  let arity = the Int $ cast $ length fields
+  jvmArgumentTypesByIndex <- LiftIo $ Map.fromList $ zip [0 .. arity] (classType :: fieldTypes)
+  CreateMethod [Public] "generated.idr" classExport.name "<init>" descriptor signature Nothing [] []
+  MethodCodeStart
+  CreateLabel methodStartLabel
+  CreateLabel methodEndLabel
+  LabelStart methodStartLabel
+  Aload 0
+  InvokeMethod InvokeSpecial extendsTypeName "<init>" "()V" False
+  assignFields jvmArgumentTypesByIndex fields
+  Return
+  LabelStart methodEndLabel
+  LocalVariable "this" (getJvmTypeDescriptor classType) Nothing methodStartLabel methodEndLabel 0
+  traverse_ (uncurry addLocalVariable) $ zip [1 .. arity] fields
+  MaxStackAndLocal (-1) (-1)
+  MethodCodeEnd
+ where
+  assignField : Map Int InferredType -> Int -> FieldExport -> Asm ()
+  assignField jvmArgumentTypesByIndex varIndex field = do
+    let fieldType = field.type
+    Aload 0
+    loadVar jvmArgumentTypesByIndex fieldType fieldType varIndex
+    Field PutField classExport.name field.name (getJvmTypeDescriptor fieldType)
+
+  assignFields : Map Int InferredType -> List FieldExport -> Asm ()
+  assignFields jvmArgumentTypesByIndex fieldExports = do
+    let arity = the Int $ cast $ length fieldExports
+    let varIndexAndExports = zip [1 .. arity] fieldExports
+    traverse_ (uncurry $ assignField jvmArgumentTypesByIndex) varIndexAndExports
+
+  addLocalVariable : Int -> FieldExport -> Asm ()
+  addLocalVariable index field = do
+    let fieldType = field.type
+    LocalVariable field.name (getJvmTypeDescriptor fieldType) Nothing methodStartLabel methodEndLabel index
+
+generateRequiredArgsConstructor : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateRequiredArgsConstructor descriptorsByEncloser classExport = do
+  let allFields = getFields $ fromMaybe [] $ SortedMap.lookup classExport descriptorsByEncloser
+  let requiredFields = filter isRequiredField allFields
+  when (not $ isNil requiredFields) $ generateConstructor descriptorsByEncloser classExport requiredFields
+
+generateAllArgsConstructor : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateAllArgsConstructor descriptorsByEncloser classExport = do
+  let Just (MkAnnotation _ props) = findAllArgsConstructor classExport
+        | _ => Pure ()
+  let fields = getFields $ fromMaybe [] $ SortedMap.lookup classExport descriptorsByEncloser
+  let excludedFields = getStringAnnotationValues $ snd $ fromMaybe ("exclude", AnnArray []) $
+                        (find (\(name, value) => name == "exclude") props)
+  let constructorFields = filter (\fieldExport => not $ elem fieldExport.name excludedFields) fields
+  generateConstructor descriptorsByEncloser classExport constructorFields
+
+generateNoArgsConstructor : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateNoArgsConstructor descriptorsByEncloser classExport = do
+  CreateMethod [Public] "generated.idr" classExport.name "<init>" "()V" Nothing Nothing [] []
+  MethodCodeStart
+  Aload 0
+  extendsTypeName <- getJvmReferenceTypeName classExport.extends
+  InvokeMethod InvokeSpecial extendsTypeName "<init>" "()V" False
+  Return
+  MaxStackAndLocal (-1) (-1)
+  MethodCodeEnd
+
+generateHashCode : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateHashCode descriptorsByEncloser classExport = do
+  let fields = filter (not . isTransientField) $ getFields $
+                 fromMaybe [] $ SortedMap.lookup classExport descriptorsByEncloser
+  CreateMethod [Public] "generated.idr" classExport.name "hashCode" "()I" Nothing Nothing [] []
+  MethodCodeStart
+  let fieldsCount = the Int $ cast $ length fields
+  Iconst fieldsCount
+  Anewarray "java/lang/Object"
+  traverse_ (uncurry loadField) $ zip [0 .. fieldsCount - 1] fields
+  InvokeMethod InvokeStatic "java/util/Objects" "hash" "([Ljava/lang/Object;)I" False
+  Ireturn
+  MaxStackAndLocal (-1) (-1)
+  MethodCodeEnd
+ where
+  loadField : Int -> FieldExport -> Asm ()
+  loadField index field = do
+    Dup
+    Iconst index
+    Aload 0
+    let fieldType = field.type
+    Field GetField classExport.name field.name (getJvmTypeDescriptor fieldType)
+    asmCast fieldType inferredObjectType
+    Aastore
+
+generateEquals : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateEquals descriptorsByEncloser classExport = do
+  let fields = filter (not . isTransientField) $ getFields $
+                 fromMaybe [] $ SortedMap.lookup classExport descriptorsByEncloser
+  CreateMethod [Public] "generated.idr" classExport.name "equals" "(Ljava/lang/Object;)Z" Nothing Nothing [] []
+  MethodCodeStart
+  Aload 0
+  Aload 1
+  refEqLabel <- newLabel
+  CreateLabel refEqLabel
+  Ifacmpne refEqLabel
+  Iconst 1
+  Ireturn
+  LabelStart refEqLabel
+  Aload 1
+  let className = classExport.name
+  InstanceOf className
+  instanceOfLabel <- newLabel
+  CreateLabel instanceOfLabel
+  Ifne instanceOfLabel
+  Iconst 0
+  Ireturn
+  LabelStart instanceOfLabel
+  Aload 1
+  checkcast className
+  Astore 2
+  let fieldsCount = the Int $ cast $ length fields
+  equalsLabel <- newLabel
+  CreateLabel equalsLabel
+  equalsFields equalsLabel fields
+  Iconst 1
+  methodEndLabel <- newLabel
+  CreateLabel methodEndLabel
+  Goto methodEndLabel
+  LabelStart equalsLabel
+  Iconst 0
+  LabelStart methodEndLabel
+  Ireturn
+  MaxStackAndLocal (-1) (-1)
+  MethodCodeEnd
+ where
+  equalsFields : String -> List FieldExport -> Asm ()
+  equalsFields equalsLabel [] = Pure ()
+  equalsFields equalsLabel (field :: rest) = do
+    let fieldType = field.type
+    let className = classExport.name
+    Aload 0
+    Field GetField className field.name (getJvmTypeDescriptor fieldType)
+    asmCast fieldType inferredObjectType
+    Aload 2
+    Field GetField className field.name (getJvmTypeDescriptor fieldType)
+    asmCast fieldType inferredObjectType
+    InvokeMethod InvokeStatic "java/util/Objects" "equals" "(Ljava/lang/Object;Ljava/lang/Object;)Z" False
+    Ifeq equalsLabel
+    equalsFields equalsLabel rest
+
+generateToString : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateToString descriptorsByEncloser classExport = do
+  let fields = getFields $ fromMaybe [] $ SortedMap.lookup classExport descriptorsByEncloser
+  CreateMethod [Public] "generated.idr" classExport.name "toString" "()Ljava/lang/String;" Nothing Nothing [] []
+  MethodCodeStart
+  New "java/lang/StringBuilder"
+  Dup
+  InvokeMethod InvokeSpecial "java/lang/StringBuilder" "<init>" "()V" False
+  Ldc $ StringConst classExport.name
+  InvokeMethod InvokeVirtual "java/lang/StringBuilder" "append" "(Ljava/lang/String;)Ljava/lang/StringBuilder;" False
+  let hasFields = not $ isNil fields
+  when hasFields $ do
+    appendFields "{" fields
+    Iconst 125 -- '}'
+    InvokeMethod InvokeVirtual "java/lang/StringBuilder" "append" "(C)Ljava/lang/StringBuilder;" False
+  InvokeMethod InvokeVirtual "java/lang/StringBuilder" "toString" "()Ljava/lang/String;" False
+  Areturn
+  MaxStackAndLocal (-1) (-1)
+  MethodCodeEnd
+ where
+  getAppendParamType : InferredType -> InferredType
+  getAppendParamType IChar = IChar
+  getAppendParamType IBool = IBool
+  getAppendParamType (IArray IChar) = IArray IChar
+  getAppendParamType IDouble = IDouble
+  getAppendParamType IFloat = IFloat
+  getAppendParamType IInt = IInt
+  getAppendParamType IByte = IInt
+  getAppendParamType IShort = IInt
+  getAppendParamType ILong = ILong
+  getAppendParamType ty =
+    if (ty == iref "java/lang/CharSequence" [] || ty == inferredStringType ||
+      ty == iref "java/lang/StringBuffer" []) then ty
+    else inferredObjectType
+
+  appendFields : String -> List FieldExport -> Asm ()
+  appendFields _ [] = Pure ()
+  appendFields prefixChar (field :: rest) = do
+    let fieldName = field.name
+    let fieldType = field.type
+    let className = classExport.name
+    let isStringField = field.type == inferredStringType
+    Ldc $ StringConst (prefixChar ++ fieldName ++ "=" ++ if isStringField then "'" else "")
+    InvokeMethod InvokeVirtual "java/lang/StringBuilder" "append" "(Ljava/lang/String;)Ljava/lang/StringBuilder;" False
+    Aload 0
+    Field GetField className fieldName (getJvmTypeDescriptor fieldType)
+    let appendParamType = getAppendParamType fieldType
+    asmCast fieldType appendParamType
+    let stringBuilderType = iref "java/lang/StringBuilder" []
+    let appendDescriptor = getMethodDescriptor $ MkInferredFunctionType stringBuilderType [appendParamType]
+    InvokeMethod InvokeVirtual "java/lang/StringBuilder" "append" appendDescriptor False
+    when isStringField $ do
+      Iconst 39 -- single quote
+      InvokeMethod InvokeVirtual "java/lang/StringBuilder" "append" "(C)Ljava/lang/StringBuilder;" False
+    appendFields ", " rest
+
+generateDataClass : SortedMap ClassExport (List ExportDescriptor) -> ClassExport -> Asm ()
+generateDataClass descriptorsByEncloser classExport = do
+  generateGetters descriptorsByEncloser classExport
+  generateSetters descriptorsByEncloser classExport
+  generateRequiredArgsConstructor descriptorsByEncloser classExport
+  generateHashCode descriptorsByEncloser classExport
+  generateEquals descriptorsByEncloser classExport
+  generateToString descriptorsByEncloser classExport
+
+exportMemberIo : AsmGlobalState -> SortedMap ClassExport (List ExportDescriptor) -> ExportDescriptor -> IO ()
+exportMemberIo globalState descriptorsByEncloser (MkMethodExportDescriptor desc) =
+  if desc.name == "<init>"
+    then do
+      let idrisName = desc.idrisName
+      fcDef <- getFcAndDefinition globalState (jvmSimpleName idrisName)
+      case nullableToMaybe fcDef of
+        Just (fc, MkNmFun args expr) => do
+            let jname = jvmName desc.idrisName
+            let dottedClassName = replace (className jname) '/' '.'
+            let constructorIdrisName = NS (mkNamespace desc.encloser.name) (UN $ Basic (methodName jname ++ "<init>"))
+            programName <- AsmGlobalState.getProgramName globalState
+            asmState <- createAsmStateJavaName globalState desc.encloser.name
+            ignore $ asm asmState $ do
+              Just superCallExpr <- getSuperCallExpr expr
+                | Nothing => asmCrash ("Constructor export for " ++ show idrisName ++ " should call 'super'")
+              inferDef programName constructorIdrisName fc (MkNmFun args superCallExpr)
+              resetScope
+              loadFunction $ jvmName constructorIdrisName
+              exportFunction desc
+              scopes <- LiftIo $ ArrayList.new {elemTy=Scope}
+              updateCurrentFunction $ { scopes := (subtyping scopes), optimizedBody := emptyFunction }
+        _ => pure ()
+    else do
+      asmState <- createAsmStateJavaName globalState desc.encloser.name
+      ignore $ asm asmState $ exportFunction desc
+exportMemberIo globalState descriptorsByEncloser (MkFieldExportDescriptor desc) = do
+  asmState <- createAsmStateJavaName globalState desc.encloser.name
+  ignore $ asm asmState $ exportField desc
+exportMemberIo globalState descriptorsByEncloser (MkClassExportDescriptor classExport) = do
+  asmState <- createAsmStateJavaName globalState classExport.name
+  ignore $ asm asmState $ exportClass classExport
+  let hasDataAnnotation = isJust (findClassAnnotation "Data" classExport)
+  ignore $ asm asmState $ generateAllArgsConstructor descriptorsByEncloser classExport
+  when (isJust (findNoArgsConstructor classExport)) $
+    ignore $ asm asmState $ generateNoArgsConstructor descriptorsByEncloser classExport
+  when (not hasDataAnnotation && isJust (findRequiredArgsConstructor classExport)) $
+    ignore $ asm asmState $ generateRequiredArgsConstructor descriptorsByEncloser classExport
+  when hasDataAnnotation $ ignore $ asm asmState $ generateDataClass descriptorsByEncloser classExport
+  when (not hasDataAnnotation && isJust (findClassAnnotation "Getter" classExport)) $
+    ignore $ asm asmState $ generateGetters descriptorsByEncloser classExport
+  when (not hasDataAnnotation && isJust (findClassAnnotation "Setter" classExport)) $
+    ignore $ asm asmState $ generateSetters descriptorsByEncloser classExport
+  when (not hasDataAnnotation && isJust (findClassAnnotation "EqualsAndHashCode" classExport)) $ do
+      ignore $ asm asmState $ generateEquals descriptorsByEncloser classExport
+      ignore $ asm asmState $ generateHashCode descriptorsByEncloser classExport
+exportMemberIo _ _ _ = pure ()
+
+groupByEncloser : List ExportDescriptor -> SortedMap ClassExport (List ExportDescriptor)
+groupByEncloser descriptors =
+  let (classExports, methodFieldExports) = partitionExports ([], []) descriptors
+      classExportsByName = SortedMap.fromList $ (\classExport => (classExport.name, classExport)) <$> classExports
+  in pairEncloserDescriptor classExportsByName empty methodFieldExports
+  where
+    partitionExports : (List ClassExport, List ExportDescriptor) -> List ExportDescriptor ->
+                         (List ClassExport, List ExportDescriptor)
+    partitionExports acc [] = acc
+    partitionExports (classExports, methodFieldExports) (desc@(MkMethodExportDescriptor _) :: rest) =
+      partitionExports (classExports, desc :: methodFieldExports) rest
+    partitionExports (classExports, methodFieldExports) (desc@(MkFieldExportDescriptor _) :: rest) =
+      partitionExports (classExports, desc :: methodFieldExports) rest
+    partitionExports (classExports, methodFieldExports) (desc@(MkImportDescriptor _ _) :: rest) =
+      partitionExports (classExports, methodFieldExports) rest
+    partitionExports (classExports, methodFieldExports) ((MkClassExportDescriptor desc) :: rest) =
+      partitionExports (desc :: classExports, methodFieldExports) rest
+
+    updateExportDescriptors : ClassExport -> ExportDescriptor -> SortedMap ClassExport (List ExportDescriptor) ->
+                                SortedMap ClassExport (List ExportDescriptor)
+    updateExportDescriptors classExport desc descriptorsByEncloser =
+       mergeWith (++) descriptorsByEncloser (singleton classExport [desc])
+
+    pairEncloserDescriptor : SortedMap String ClassExport -> SortedMap ClassExport (List ExportDescriptor) ->
+                               List ExportDescriptor -> SortedMap ClassExport (List ExportDescriptor)
+    pairEncloserDescriptor classExports acc [] = acc
+    pairEncloserDescriptor classExports acc (desc@(MkMethodExportDescriptor methodExport) :: rest) =
+      let encloser = methodExport.encloser
+          classExport = fromMaybe encloser (SortedMap.lookup encloser.name classExports)
+      in pairEncloserDescriptor classExports (updateExportDescriptors classExport desc acc) rest
+    pairEncloserDescriptor classExports acc (desc@(MkFieldExportDescriptor fieldExport) :: rest) =
+      let encloser = fieldExport.encloser
+          classExport = fromMaybe encloser (SortedMap.lookup encloser.name classExports)
+      in pairEncloserDescriptor classExports (updateExportDescriptors classExport desc acc) rest
+    pairEncloserDescriptor classExports acc (_ :: rest) = pairEncloserDescriptor classExports acc rest
+
+export
+exportDefs : AsmGlobalState -> List (Name, String) -> IO ()
+exportDefs globalState nameAndDescriptors = do
+  descriptors <- parseExportDescriptors globalState nameAndDescriptors
+  let descriptorsByEncloser = groupByEncloser descriptors
+  traverse_ (exportMemberIo globalState descriptorsByEncloser) descriptors
+
+export
+getExport : NoMangleMap -> Name -> Maybe (Name, String)
+getExport noMangleMap name = (\descriptor => (name, descriptor)) <$> isNoMangle noMangleMap name
+
 ||| Compile a TT expression to JVM bytecode
 compileToJvmBytecode : Ref Ctxt Defs -> String -> String -> ClosedTerm -> Core ()
 compileToJvmBytecode c outputDirectory outputFile term = do
-    cdata <- getCompileData False Cases term
+    noMangleMapRef <- initNoMangle ["jvm"] (const True)
+    noMangleMap <- get NoMangleMap
+    cdata <- getCompileDataWith ["jvm"] False Cases term
     directives <- getDirectives Jvm
     let ndefs = namedDefs cdata
     let idrisMainBody = forget (mainExpr cdata)
@@ -1871,14 +2486,15 @@ compileToJvmBytecode c outputDirectory outputFile term = do
     fcAndDefinitionsByName <- coreLift $ Map.fromList nameStrFcDefs
     let nameStrDefs = getNameStrDef <$> nameStrFcDefs
     definitionsByName <- coreLift $ Map.fromList nameStrDefs
-    globalState <- coreLift $ newAsmGlobalState programName
-    let names = groupByClassName programName . traverseDepthFirst $
-      buildFunctionTreeMain mainFunctionName definitionsByName
+    globalState <- coreLift $ newAsmGlobalState programName fcAndDefinitionsByName
+    let names = fst <$> nameFcDefs
+    let namesByClassName = groupByClassName programName names
     coreLift $ do
-        assembleAsync globalState fcAndDefinitionsByName (transpose names)
-        asmState <- createAsmState globalState mainFunctionName
+        assembleAsync globalState fcAndDefinitionsByName (transpose namesByClassName)
+        exportDefs globalState $ mapMaybe (getExport noMangleMap) (fst <$> allDefs)
+        mainAsmState <- createAsmState globalState mainFunctionName
         let mainFunctionJname = jvmName mainFunctionName
-        _ <- runAsm asmState $ createMainMethod programName mainFunctionJname
+        _ <- runAsm mainAsmState $ createMainMethod programName mainFunctionJname
         classCodeEnd globalState outputDirectory outputFile (className mainFunctionJname)
 
 ||| JVM bytecode implementation of the `compileExpr` interface.

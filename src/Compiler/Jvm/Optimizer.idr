@@ -10,6 +10,7 @@ import Control.Monad.State
 
 import Core.Context
 import Core.Name
+import Core.Reflect
 import Core.TT
 
 import Libraries.Data.SortedMap
@@ -18,36 +19,19 @@ import Data.List
 import Data.Maybe
 import Data.String
 import Data.Vect
+import Debug.Trace
 
 import Compiler.Jvm.Asm
 import Compiler.Jvm.ExtPrim
 import Compiler.Jvm.Foreign
 import Compiler.Jvm.InferredType
 import Compiler.Jvm.Jname
+import Compiler.Jvm.MockAsm
 import Compiler.Jvm.ShowUtil
 
 %hide Core.Context.Context.Constructor.arity
-
-isBoolTySpec : String -> Name -> Bool
-isBoolTySpec "Prelude" (UN (Basic "Bool")) = True
-isBoolTySpec "Prelude.Basics" (UN (Basic "Bool")) = True
-isBoolTySpec _ _ = False
-
-export
-tySpec : NamedCExp -> Asm InferredType
-tySpec (NmCon fc (UN (Basic "Int")) _ _ []) = pure IInt
-tySpec (NmCon fc (UN (Basic "Integer")) _ _ []) = pure inferredBigIntegerType
-tySpec (NmCon fc (UN (Basic "String")) _ _ []) = pure inferredStringType
-tySpec (NmCon fc (UN (Basic "Double")) _ _ []) = pure IDouble
-tySpec (NmCon fc (UN (Basic "Char")) _ _ []) = pure IChar
-tySpec (NmCon fc (UN (Basic "Bool")) _ _ []) = pure IBool
-tySpec (NmCon fc (UN (Basic "long")) _ _ []) = pure ILong
-tySpec (NmCon fc (UN (Basic "void")) _ _ []) = pure IVoid
-tySpec (NmCon fc (UN (Basic ty)) _ _ []) = pure $ IRef ty
-tySpec (NmCon fc (NS namespaces n) _ _ []) = cond
-    [(n == UN (Basic "Unit"), pure IVoid),
-      (isBoolTySpec (show namespaces) n, pure IBool)] (pure inferredObjectType)
-tySpec ty = pure inferredObjectType
+%hide Compiler.TailRec.Function.fc
+%hide Compiler.TailRec.TcFunction.fc
 
 namespace InferredPrimType
   export
@@ -485,9 +469,9 @@ getSamDesc Function5Lambda =
   getMethodDescriptor $ MkInferredFunctionType inferredObjectType $ replicate 5 inferredObjectType
 
 export
-getLambdaInterfaceType : LambdaType -> InferredType -> InferredType
-getLambdaInterfaceType DelayedLambda returnType = delayedType
-getLambdaInterfaceType _ returnType = inferredLambdaType
+getLambdaInterfaceType : LambdaType -> InferredType
+getLambdaInterfaceType DelayedLambda = delayedType
+getLambdaInterfaceType _ = inferredLambdaType
 
 export
 getLambdaImplementationMethodReturnType : LambdaType -> InferredType
@@ -562,11 +546,81 @@ createNewVariable variablePrefix ty = do
     variable <- generateVariable variablePrefix
     ignore $ addVariableType variable ty
 
+export
+isIoAction : NamedCExp -> Bool
+isIoAction (NmCon _ (UN (Basic "->")) _ _ [argumentType, returnType]) = isIoAction returnType
+isIoAction (NmApp _ (NmRef _ name) _) = name == primio "PrimIO"
+isIoAction (NmCon _ name _ _ _) = name == primio "IORes"
+isIoAction (NmLam fc arg expr) = isIoAction expr
+isIoAction expr = False
+
+voidTypeExpr : NamedCExp
+voidTypeExpr = NmCon emptyFC (UN (Basic "void")) TYCON Nothing []
+
+export
+getJavaLambdaType : FC -> List NamedCExp -> Asm JavaLambdaType
+getJavaLambdaType fc [functionType, javaInterfaceType, _] =
+    do
+      implementationType <- parseFunctionType functionType
+      (interfaceTy, methodName, methodType) <- parseJavaInterfaceType javaInterfaceType
+      Pure $ MkJavaLambdaType interfaceTy methodName methodType implementationType
+  where
+    parseFunctionType: NamedCExp -> Asm InferredFunctionType
+    parseFunctionType functionType = do
+        types <- go [] functionType
+        case types of
+          [] => asmCrash ("Invalid Java lambda at " ++ show fc ++ ": " ++ show functionType)
+          (returnType :: argTypes) => Pure $ MkInferredFunctionType returnType (reverse argTypes)
+      where
+        go : List InferredType -> NamedCExp -> Asm (List InferredType)
+        go acc (NmCon _ (UN (Basic "->")) _ _ [argTy, lambdaTy]) = do
+          argInferredTy <- tySpec argTy
+          restInferredTypes <- go acc lambdaTy
+          Pure (restInferredTypes ++ (argInferredTy :: acc))
+        go acc (NmLam fc arg expr) = go acc expr
+        go acc expr@(NmApp _ (NmRef _ name) [arg]) = go (IInt :: acc) (if name == primio "PrimIO" then arg else expr)
+        go acc expr = Pure (!(tySpec expr) :: acc)
+
+    throwExpectedStructAtPos : Asm a
+    throwExpectedStructAtPos =
+      asmCrash ("Expected a struct containing interface name and method separated by space at " ++ show fc)
+
+    throwExpectedStruct : String -> Asm a
+    throwExpectedStruct name =
+      asmCrash ("Expected a struct containing interface name and method separated by space at " ++
+         show fc ++ " but found " ++ name)
+
+    parseJavaInterfaceType : NamedCExp -> Asm (InferredType, String, InferredFunctionType)
+    parseJavaInterfaceType expr@(NmCon _ name _ _ [interfaceType, methodTypeExp]) =
+        if name == builtin "Pair" then
+          case interfaceType of
+            NmCon _ name _ _ (NmPrimVal _ (Str namePartsStr) :: _) =>
+              if name == structName
+                then case words namePartsStr of
+                  (interfaceName :: methodName :: _) => do
+                    methodType <- parseFunctionType methodTypeExp
+                    Pure (IRef interfaceName Interface [], methodName, methodType)
+                  _ => asmCrash ("Expected interface name and method separated by space at " ++ show fc ++ ": " ++
+                        namePartsStr)
+                else throwExpectedStruct namePartsStr
+            _ => throwExpectedStructAtPos
+        else asmCrash ("Expected a tuple containing interface type and method type but found: " ++ showNamedCExp 0 expr)
+    parseJavaInterfaceType (NmApp _ (NmRef _ name) _) = do
+        (_, MkNmFun _ def) <- getFcAndDefinition (jvmSimpleName name)
+          | _ => asmCrash ("Expected a function returning a tuple containing interface type and method type at " ++
+                   show fc)
+        parseJavaInterfaceType def
+    parseJavaInterfaceType (NmDelay _ _ expr) = parseJavaInterfaceType expr
+    parseJavaInterfaceType expr = asmCrash ("Expected a tuple containing interface type and method type but found: " ++ showNamedCExp 0 expr)
+
+getJavaLambdaType fc exprs = asmCrash ("Invalid Java lambda at " ++ show fc ++ ": " ++ show exprs)
+
 mutual
     inferExpr : InferredType -> NamedCExp -> Asm InferredType
     inferExpr exprTy (NmDelay _ _ expr) = inferExprLam AppliedLambdaUnknown Nothing Nothing expr
     inferExpr exprTy expr@(NmLocal _ var) = addVariableType (jvmSimpleName var) exprTy
     inferExpr exprTy (NmRef _ name) = pure exprTy
+    inferExpr exprTy app@(NmApp _ (NmRef _ name) args) = inferExprApp exprTy app
     inferExpr _ (NmApp fc (NmLam _ var body) [expr]) =
         inferExprLam (getAppliedLambdaType fc) (Just expr) (Just var) body
     inferExpr _ (NmLam _ var body) = inferExprLam AppliedLambdaUnknown Nothing (Just var) body
@@ -697,16 +751,25 @@ mutual
     inferExtPrimArg (arg, ty) = inferExpr ty arg
 
     inferExtPrim : FC -> InferredType -> ExtPrim -> List NamedCExp -> Asm InferredType
+    inferExtPrim fc returnType GetStaticField descriptors = inferExtPrim fc returnType JvmStaticMethodCall descriptors
+    inferExtPrim fc returnType SetStaticField descriptors = inferExtPrim fc returnType JvmStaticMethodCall descriptors
+    inferExtPrim fc returnType GetInstanceField descriptors = inferExtPrim fc returnType JvmStaticMethodCall descriptors
+    inferExtPrim fc returnType SetInstanceField descriptors = inferExtPrim fc returnType JvmStaticMethodCall descriptors
     inferExtPrim fc returnType JvmInstanceMethodCall descriptors =
-        inferExtPrim fc returnType JvmStaticMethodCall descriptors
+      inferExtPrim fc returnType JvmStaticMethodCall descriptors
     inferExtPrim fc returnType JvmStaticMethodCall [ret, NmApp _ _ [functionNamePrimVal], fargs, world] =
       inferExtPrim fc returnType JvmStaticMethodCall [ret, functionNamePrimVal, fargs, world]
-    inferExtPrim _ returnType JvmStaticMethodCall [ret, NmPrimVal fc (Str fn), fargs, world]
+    inferExtPrim _ returnType JvmStaticMethodCall [ret, _, fargs, _]
       = do args <- getFArgs fargs
            argTypes <- traverse tySpec (map fst args)
            methodReturnType <- tySpec ret
            traverse_ inferExtPrimArg $ zip (map snd args) argTypes
            pure $ if methodReturnType == IVoid then inferredObjectType else methodReturnType
+    inferExtPrim fc returnType JvmSuper [clazz, fargs, world] = do
+      rootMethodName <- getRootMethodName
+      if (endsWith (methodName rootMethodName) "$ltinit$gt")
+        then inferExtPrim fc returnType JvmStaticMethodCall [voidTypeExpr, NmErased fc, fargs, world]
+        else pure IUnknown
     inferExtPrim _ returnType NewArray [_, size, val, world] = do
         ignore $ inferExpr IInt size
         ignore $ inferExpr IUnknown val
@@ -720,6 +783,25 @@ mutual
         ignore $ inferExpr IInt pos
         ignore $ inferExpr IUnknown val
         pure inferredObjectType
+    inferExtPrim _ returnType JvmNewArray [tyExpr, size, world] = do
+        ignore $ inferExpr IInt size
+        elemTy <- tySpec tyExpr
+        pure $ IArray elemTy
+    inferExtPrim _ returnType JvmSetArray [tyExpr, index, val, arr, world] = do
+        elemTy <- tySpec tyExpr
+        ignore $ inferExpr (IArray elemTy) arr
+        ignore $ inferExpr IInt index
+        ignore $ inferExpr elemTy val
+        pure inferredObjectType
+    inferExtPrim _ returnType JvmGetArray [tyExpr, index, arr, world] = do
+        elemTy <- tySpec tyExpr
+        ignore $ inferExpr (IArray elemTy) arr
+        ignore $ inferExpr IInt index
+        pure elemTy
+    inferExtPrim _ returnType JvmArrayLength [tyExpr, arr] = do
+        elemTy <- tySpec tyExpr
+        ignore $ inferExpr (IArray elemTy) arr
+        pure IInt
     inferExtPrim _ returnType NewIORef [_, val, world] = do
         ignore $ inferExpr IUnknown val
         pure refType
@@ -733,10 +815,18 @@ mutual
     inferExtPrim _ returnType SysOS [] = pure inferredStringType
     inferExtPrim _ returnType SysCodegen [] = pure inferredStringType
     inferExtPrim _ returnType VoidElim _ = pure inferredObjectType
-    inferExtPrim _ returnType (Unknown name) _ = asmCrash $ "Can't compile unknown external directive " ++ show name
+    inferExtPrim _ returnType JvmClassLiteral [_] = pure $ IRef "java/lang/Class" Class []
+    inferExtPrim _ returnType JvmInstanceOf [_, obj, _] = do
+      ignore $ inferExpr IUnknown obj
+      pure IBool
+    inferExtPrim _ returnType JvmRefEq [_, _, x, y] = inferBoolOp IUnknown x y
+    inferExtPrim fc returnType JavaLambda [functionType, javaInterfaceType, lambda] = do
+      ignore $ inferExpr IUnknown lambda
+      IFunction <$> getJavaLambdaType fc [functionType, javaInterfaceType, lambda]
     inferExtPrim _ returnType MakeFuture [_, action] = do
         ignore $ inferExpr delayedType action
         pure inferredForkJoinTaskType
+    inferExtPrim _ returnType (Unknown name) _ = asmCrash $ "Can't compile unknown external directive " ++ show name
     inferExtPrim fc _ prim args = Throw fc $ "Unsupported external function " ++ show prim ++ "(" ++
         (show $ showNamedCExp 0 <$> args) ++ ")"
 
@@ -756,7 +846,7 @@ mutual
             Pure lambdaBodyReturnType
         Pure $ if hasParameterValue
             then lambdaBodyReturnType
-            else getLambdaInterfaceType lambdaType lambdaBodyReturnType
+            else getLambdaInterfaceType lambdaType
       where
         createAndAddVariable : (String, InferredType) -> Asm ()
         createAndAddVariable (name, ty) = do
@@ -842,10 +932,10 @@ mutual
     inferSelfTailCallParameter : Map Int InferredType -> Map Int String -> (NamedCExp, Int) -> Asm ()
     inferSelfTailCallParameter types argumentNameByIndices (arg, index) = do
         optTy <- LiftIo $ Map.get types index
-        let variableType = fromMaybe IUnknown optTy
+        let variableType = fromMaybe IUnknown $ nullableToMaybe optTy
         ty <- inferExpr variableType arg
         optName <- LiftIo $ Map.get {value=String} argumentNameByIndices index
-        maybe (Pure ()) (doAddVariableType ty) optName
+        maybe (Pure ()) (doAddVariableType ty) $ nullableToMaybe optName
       where
         doAddVariableType : InferredType -> String -> Asm ()
         doAddVariableType ty name = do
@@ -973,8 +1063,8 @@ showScopes n = do
     logAsm $ show scope
     when (n > 0) $ showScopes (n - 1)
 
-tailRecLoopFunctionName : String -> Name
-tailRecLoopFunctionName programName =
+tailRecLoopFunctionName : Name
+tailRecLoopFunctionName =
   NS (mkNamespace "io.github.mmhelloworld.idrisjvm.runtime.Runtime") (UN $ Basic "tailRec")
 
 delayNilArityExpr : FC -> (args: List Name) -> NamedCExp -> NamedCExp
@@ -1007,7 +1097,7 @@ export
 optimize : String -> List (Name, FC, NamedDef) -> List (Name, FC, NamedDef)
 optimize programName allDefs =
   let tailRecOptimizedDefs = concatMap (optimizeTailRecursion programName) allDefs
-      tailCallOptimizedDefs = TailRec.functions (tailRecLoopFunctionName programName) tailRecOptimizedDefs
+      tailCallOptimizedDefs = TailRec.functions tailRecLoopFunctionName tailRecOptimizedDefs
   in toNameFcDef <$> tailCallOptimizedDefs
 
 export
@@ -1022,8 +1112,8 @@ inferDef programName idrisName fc (MkNmFun args expr) = do
     let initialArgumentTypes = replicate arity inferredObjectType
     let inferredFunctionType = MkInferredFunctionType inferredObjectType initialArgumentTypes
     argumentTypesByName <- LiftIo $ Map.fromList $ zip argumentNames initialArgumentTypes
-    scopes <- LiftIo $ JList.new {a=Scope}
-    let function = MkFunction jname inferredFunctionType scopes 0 jvmClassAndMethodName emptyFunction
+    scopes <- LiftIo $ ArrayList.new {elemTy=Scope}
+    let function = MkFunction jname inferredFunctionType (subtyping scopes) 0 jvmClassAndMethodName emptyFunction
     setCurrentFunction function
     LiftIo $ AsmGlobalState.addFunction !getGlobalState jname function
     updateCurrentFunction $ { optimizedBody := expr }
@@ -1058,10 +1148,10 @@ inferDef programName idrisName fc (MkNmFun args expr) = do
             go1 acc [] = pure acc
             go1 acc (arg :: args) = do
                 optIndex <- Map.get {value=Int} argumentIndicesByName arg
-                ty <- case optIndex of
+                ty <- case nullableToMaybe optIndex of
                     Just index => do
                         optTy <- Map.get argumentTypesByIndex index
-                        pure $ fromMaybe IUnknown optTy
+                        pure $ fromMaybe IUnknown $ nullableToMaybe optTy
                     Nothing => pure IUnknown
                 go1 (ty :: acc) args
 
@@ -1071,3 +1161,7 @@ inferDef programName idrisName fc def@(MkNmForeign foreignDescriptors argumentTy
     inferForeign programName idrisName fc foreignDescriptors argumentTypes returnType
 
 inferDef _ _ _ _ = Pure ()
+
+export
+asm : AsmState -> Asm a -> IO (a, AsmState)
+asm = if shouldDebugAsm then mockRunAsm else runAsm

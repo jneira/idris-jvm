@@ -83,7 +83,7 @@ parameters (defs: Map String NamedDef)
         findDef : Name -> Maybe NamedDef
         findDef name =
             let nameStr = jvmSimpleName name
-            in unsafePerformIO $ Map.get defs nameStr
+            in nullableToMaybe $ unsafePerformIO $ Map.get defs nameStr
 
         buildFunctionTree : SortedSet Name -> Name -> (SortedSet Name, Tree Name)
         buildFunctionTree visitedSoFar name =
